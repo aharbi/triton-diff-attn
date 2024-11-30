@@ -1,0 +1,6 @@
+apex==0.1
+flash-attn==2.7.0
+torch==2.5.1
+triton==3.1.0
+pandas==2.2.3
+matplotlib==3.9.2
