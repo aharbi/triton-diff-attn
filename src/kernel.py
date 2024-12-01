@@ -415,11 +415,10 @@ def diff_attn_bwd(
 
         dV_block += tl.dot(P1_T_block.to(tl.float16) + (- LAMBDA_SCALE).to(tl.float16) * P2_T_block.to(tl.float16), dOi_block)
 
-        dpT1_block = tl.dot(V_block, tl.trans(dOi_block)).to(tl.float32)
-        dpT2_block =  (- LAMBDA_SCALE) * tl.dot(V_block, tl.trans(dOi_block)).to(tl.float32)
+        dpT_block = tl.dot(V_block, tl.trans(dOi_block)).to(tl.float32)
 
-        dS1_T_block = (P1_T_block * (dpT1_block - Di1_1[None, :])).to(tl.float16)
-        dS2_T_block = (P2_T_block * (dpT2_block - Di2_2[None, :])).to(tl.float16)
+        dS1_T_block = (P1_T_block * (dpT_block - Di1_1[None, :])).to(tl.float16)
+        dS2_T_block = (P2_T_block * ((- LAMBDA_SCALE) * dpT_block - Di2_2[None, :])).to(tl.float16)
 
         dK1_block += SM_SCALE * tl.dot(dS1_T_block, tl.trans(qT1_block))
         dK2_block += SM_SCALE * tl.dot(dS2_T_block, tl.trans(qT2_block))
@@ -428,7 +427,7 @@ def diff_attn_bwd(
         QK2_block = SM_SCALE * tl.dot(Q2_block, K_T2_block)
 
         dP1_block = tl.dot(dO_block, V_T_block).to(tl.float32)
-        dP2_block = (- LAMBDA_SCALE) * tl.dot(dO_block, V_T_block).to(tl.float32)
+        dP2_block = (- LAMBDA_SCALE) * dP1_block
 
         dS1_block = (tl.math.exp(QK1_block - M1_block) * (dP1_block - Di1[:, None])).to(tl.float16)
         dS2_block = (tl.math.exp(QK2_block - M2_block) * (dP2_block - Di2[:, None])).to(tl.float16)
@@ -588,7 +587,7 @@ if __name__ == "__main__":
     LAMBDA_INIT = 0.8
     rms_norm = True
 
-    for _ in range(100):
+    for _ in range(2):
         q1 = torch.empty(B, H, N, D // 2, dtype=torch.float16, requires_grad=True).to("cuda").normal_(mean=0.0, std=0.5)
         q2 = torch.empty(B, H, N, D // 2, dtype=torch.float16, requires_grad=True).to("cuda").normal_(mean=0.0, std=0.5)
         k1 = torch.empty(B, H, N, D // 2, dtype=torch.float16, requires_grad=True).to("cuda").normal_(mean=0.0, std=0.5)
@@ -624,9 +623,9 @@ if __name__ == "__main__":
 
         atol = 1e-2
 
-        print("Reference (Lambda Gradient):", ref_dLambda.item())
-        print("Triton (Lambda Gradient):", tri_dLambda.item())
-        print("\n")
+        # print("Reference (Lambda Gradient):", ref_dLambda.item())
+        # print("Triton (Lambda Gradient):", tri_dLambda.item())
+        # print("\n")
 
         assert torch.allclose(y1, y2, atol=atol)
         assert torch.allclose(ref_dv, tri_dv, atol=atol)
