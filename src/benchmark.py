@@ -17,12 +17,12 @@ from layers import (
 )
 
 # Benchmarking parameters
-FOLDER_PREFIX = "A100"      # Prefix for saving results
-BATCH_SIZE = 1              # Batch size
-NUM_HEADS = 16              # Number of heads
-HEAD_DIM = 128              # For standard attention, actual head_dim is 2 * HEAD_DIM
-MODE = "fwd+bwd"            # Benchmark mode: "fwd" or "fwd+bwd"
-RMS_NORM = False            # Compile kernel with RMS normalization
+FOLDER_PREFIX = "A100"                                  # Prefix for saving results
+NUM_HEADS = 16                                          # Number of heads
+HEAD_DIM = 32                                           # Actual head_dim is 2 * HEAD_DIM
+MODE = "fwd+bwd"                                        # Benchmark mode: "fwd" or "fwd+bwd"
+RMS_NORM = True                                         # Compile kernel with RMS normalization
+SEQ_LENS = [512, 1024, 2048, 4096, 8192, 16384]         # Sequence lengths
 
 
 def set_deterministic(seed=0):
@@ -53,7 +53,7 @@ def random_tensor_generator(*shape, dtype: torch.dtype, device: str):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["seq_len"],
-        x_vals=[64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
+        x_vals=SEQ_LENS,
         y_log=True,
         ylabel="Runtime (ms)",
         line_arg="implementation",
@@ -75,7 +75,6 @@ def random_tensor_generator(*shape, dtype: torch.dtype, device: str):
         args={
             "num_heads": NUM_HEADS,
             "head_dim": HEAD_DIM,
-            "batch_size": BATCH_SIZE,
             "mode": MODE,
             "rms_norm": RMS_NORM,
         },
@@ -85,7 +84,6 @@ def benchmark_runtime(
     seq_len: int,
     num_heads: int,
     head_dim: int,
-    batch_size: int,
     mode: str,
     rms_norm: bool,
     implementation: str,
@@ -94,6 +92,7 @@ def benchmark_runtime(
 ):
 
     quantiles = [0.5, 0.05, 0.95]
+    batch_size = int(16384 / seq_len)
 
     random_tensor = lambda *shape: random_tensor_generator(
         *shape, dtype=dtype, device=device
@@ -118,6 +117,7 @@ def benchmark_runtime(
         k1 = random_tensor(batch_size, num_heads, seq_len, head_dim)
         k2 = random_tensor(batch_size, num_heads, seq_len, head_dim)
         v = random_tensor(batch_size, num_heads, seq_len, 2 * head_dim)
+        lambda_scale = random_tensor(1)
     else:
         q = random_tensor(batch_size, num_heads, seq_len, 2 * head_dim)
         k = random_tensor(batch_size, num_heads, seq_len, 2 * head_dim)
@@ -127,7 +127,7 @@ def benchmark_runtime(
 
     def run(mode: str):
         if fn in [MultiheadDiffAttn, MultiheadFlashDiffAttn, MultiheadDiffAttnKernel]:
-            y = fn(q1, q2, k1, k2, v, rms_norm=rms_norm)
+            y = fn(q1, q2, k1, k2, v, lambda_scale=lambda_scale, rms_norm=rms_norm)
 
             if mode == "fwd+bwd":
                 y.backward(dout)
@@ -151,7 +151,7 @@ def benchmark_runtime(
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["seq_len"],
-        x_vals=[64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
+        x_vals=SEQ_LENS,
         y_log=True,
         ylabel="Peak Memory Usage (MB)",
         line_arg="implementation",
@@ -173,7 +173,6 @@ def benchmark_runtime(
         args={
             "num_heads": NUM_HEADS,
             "head_dim": HEAD_DIM,
-            "batch_size": BATCH_SIZE,
             "mode": MODE,
             "rms_norm": RMS_NORM,
         },
@@ -183,7 +182,6 @@ def benchmark_memory_usage(
     seq_len: int,
     num_heads: int,
     head_dim: int,
-    batch_size: int,
     mode: str,
     rms_norm: bool,
     implementation: str,
@@ -191,6 +189,7 @@ def benchmark_memory_usage(
     device="cuda",
 ):
     # NOTE: Using Triton's autotune produces incorrect measurements! Disable before running this benchmark.
+    batch_size = int(16384 / seq_len)
 
     random_tensor = lambda *shape: random_tensor_generator(
         *shape, dtype=dtype, device=device
@@ -215,6 +214,7 @@ def benchmark_memory_usage(
         k1 = random_tensor(batch_size, num_heads, seq_len, head_dim)
         k2 = random_tensor(batch_size, num_heads, seq_len, head_dim)
         v = random_tensor(batch_size, num_heads, seq_len, 2 * head_dim)
+        lambda_scale = random_tensor(1)
     else:
         q = random_tensor(batch_size, num_heads, seq_len, 2 * head_dim)
         k = random_tensor(batch_size, num_heads, seq_len, 2 * head_dim)
@@ -226,7 +226,7 @@ def benchmark_memory_usage(
 
     if fn in [MultiheadDiffAttn, MultiheadFlashDiffAttn, MultiheadDiffAttnKernel]:
         try:
-            y = fn(q1, q2, k1, k2, v, rms_norm=rms_norm)
+            y = fn(q1, q2, k1, k2, v, lambda_scale=lambda_scale, rms_norm=rms_norm)
 
             if mode == "fwd+bwd":
                 y.backward(dout)
@@ -256,7 +256,7 @@ def benchmark_difference(
     seq_len: int = 256,
     head_dim: int = HEAD_DIM,
     num_heads: int = NUM_HEADS,
-    batch_size: int = BATCH_SIZE,
+    batch_size: int = 1,
     mode: str = MODE,
     rms_norm: bool = RMS_NORM,
     N: int = 100,
@@ -283,11 +283,12 @@ def benchmark_difference(
             k1 = random_tensor(batch_size, num_heads, seq_len, head_dim)
             k2 = random_tensor(batch_size, num_heads, seq_len, head_dim)
             v = random_tensor(batch_size, num_heads, seq_len, 2 * head_dim)
+            lambda_scale = random_tensor(1)
 
             dout = torch.rand_like(v)
 
-            y1 = fn1(q1, q2, k1, k2, v, rms_norm=rms_norm)
-            y2 = fn2(q1, q2, k1, k2, v, rms_norm=rms_norm)
+            y1 = fn1(q1, q2, k1, k2, v, lambda_scale=lambda_scale, rms_norm=rms_norm)
+            y2 = fn2(q1, q2, k1, k2, v, lambda_scale=lambda_scale, rms_norm=rms_norm)
 
             assert torch.allclose(y1, y2, atol=1e-2, rtol=0)
 
@@ -350,16 +351,17 @@ def benchmark_difference(
 
 if __name__ == "__main__":
 
+    print("### Note: Disable Triton Autotune for accurate peak memory measurements ###")
     if MODE == "fwd+bwd":
         print("### Forward + Backward Pass Benchmark ###")
-        folder = f"{FOLDER_PREFIX}_backward_{BATCH_SIZE}_{NUM_HEADS}_{HEAD_DIM}"
+        folder = f"{FOLDER_PREFIX}_backward_{NUM_HEADS}_{HEAD_DIM}"
     else:
         print("### Forward Pass Benchmark ###")
-        folder = f"{FOLDER_PREFIX}_forward_{BATCH_SIZE}_{NUM_HEADS}_{HEAD_DIM}"
+        folder = f"{FOLDER_PREFIX}_forward_{NUM_HEADS}_{HEAD_DIM}"
 
     if RMS_NORM:
-        print("### Group Normalization Benchmark ###")
-        folder += "_group_norm"
+        print("### RMS Normalization Benchmark ###")
+        folder += "_RMS_norm"
 
     benchmark_difference(save_path=f"./results/{folder}/difference/")
     benchmark_memory_usage.run(print_data=True, save_path=f"./results/{folder}/memory/")

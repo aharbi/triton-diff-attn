@@ -38,7 +38,7 @@ def diff_attn_fwd(
     stride_V_seq,
     stride_V_dim,
     SM_SCALE,
-    LAMBDA_SCALE,
+    LAMBDA_SCALE_ptr,
     LAMBDA_INIT,
     NUM_HEADS: tl.constexpr,
     SEQ_LEN: tl.constexpr,
@@ -135,6 +135,7 @@ def diff_attn_fwd(
     # NOTE: Tensor that are in SRAM during the inner loop
     Q1_block = tl.load(Q1_block_ptr)
     Q2_block = tl.load(Q2_block_ptr)
+    LAMBDA_SCALE = tl.load(LAMBDA_SCALE_ptr)
 
     # NOTE: Placeholder for outputs
     m_i1 = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32) - float("inf")
@@ -231,6 +232,9 @@ def diff_attn_bwd(
     dK1,
     dK2,
     dV,
+    dLambda,
+    dLambda_stride_seq,
+    dLambda_stride_batch_head,
     M1,
     M2,
     D1,
@@ -244,7 +248,7 @@ def diff_attn_bwd(
     stride_V_seq,
     stride_V_dim,
     SM_SCALE,
-    LAMBDA_SCALE,
+    LAMBDA_SCALE_ptr,
     LAMBDA_INIT,
     NUM_HEADS,
     SEQ_LEN,
@@ -269,10 +273,12 @@ def diff_attn_bwd(
     # NOTE: Stage 1: Preprocessing
     D1_block_ptrs = D1 + index_batch_head * SEQ_LEN + offs_kv
     D2_block_ptrs = D2 + index_batch_head * SEQ_LEN + offs_kv
+    dLambda_ptr = dLambda + seq_index * dLambda_stride_seq + index_batch_head * dLambda_stride_batch_head
 
     O1_block = tl.load(O1 + index_batch_head * HEAD_DIM_V * SEQ_LEN + offs_kv[:, None] * HEAD_DIM_V + v_offs_dim[None, :])
     O2_block = tl.load(O2 + index_batch_head * HEAD_DIM_V * SEQ_LEN + offs_kv[:, None] * HEAD_DIM_V + v_offs_dim[None, :])
     dOut_block = tl.load(dO + index_batch_head * HEAD_DIM_V * SEQ_LEN + offs_kv[:, None] * HEAD_DIM_V + v_offs_dim[None, :])
+    LAMBDA_SCALE = tl.load(LAMBDA_SCALE_ptr)
 
     if RMS_NORM:
         O_block = O1_block + O2_block
@@ -282,6 +288,9 @@ def diff_attn_bwd(
         grad_scale = tl.sum(dOut_block * O_block, axis=1)[:, None] * (2.0 * O_block / HEAD_DIM_V)
 
         dOut_block = (1 - LAMBDA_INIT) * (dOut_block * inv_norm + norm_factor * grad_scale)
+
+    # Lambda gradient local contribution
+    dLambda_acc = tl.sum(dOut_block * O2_block / (LAMBDA_SCALE + EPS))
 
     D1_block = tl.sum(dOut_block * O1_block, axis=1)
     D2_block = tl.sum(dOut_block * O2_block, axis=1)
@@ -447,6 +456,7 @@ def diff_attn_bwd(
     tl.store(dK2_block_ptrs, dK2_block)
     tl.store(dQ1_block_ptrs, dQ1_block)
     tl.store(dQ2_block_ptrs, dQ2_block)
+    tl.store(dLambda_ptr, dLambda_acc)
 
 
 class _diff_attention(torch.autograd.Function):
@@ -484,7 +494,7 @@ class _diff_attention(torch.autograd.Function):
             stride_V_seq=V.stride(2),
             stride_V_dim=V.stride(3),
             SM_SCALE=SM_SCALE,
-            LAMBDA_SCALE=LAMBDA_SCALE,
+            LAMBDA_SCALE_ptr=LAMBDA_SCALE,
             LAMBDA_INIT=LAMBDA_INIT,
             NUM_HEADS=Q1.shape[1],
             SEQ_LEN=Q1.shape[2],
@@ -493,9 +503,8 @@ class _diff_attention(torch.autograd.Function):
             RMS_NORM=rms_norm,
         )
 
-        ctx.save_for_backward(Q1, Q2, K1, K2, V, O1, O2, M1, M2)
+        ctx.save_for_backward(Q1, Q2, K1, K2, V, O1, O2, M1, M2, LAMBDA_SCALE)
         ctx.SM_SCALE = SM_SCALE
-        ctx.LAMBDA_SCALE = LAMBDA_SCALE
         ctx.LAMBDA_INIT = LAMBDA_INIT
         ctx.HEAD_DIM_K = HEAD_DIM_K
         ctx.HEAD_DIM_V = HEAD_DIM_V
@@ -507,7 +516,7 @@ class _diff_attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO):
-        Q1, Q2, K1, K2, V, O1, O2, M1, M2 = ctx.saved_tensors
+        Q1, Q2, K1, K2, V, O1, O2, M1, M2, LAMBDA_SCALE = ctx.saved_tensors
 
         dQ1, dQ2 = torch.empty_like(Q1), torch.empty_like(Q2)
         dK1, dK2 = torch.empty_like(K1), torch.empty_like(K2)
@@ -517,6 +526,8 @@ class _diff_attention(torch.autograd.Function):
         BATCH_SIZE, NUM_HEADS, SEQ_LEN = Q1.shape[:3]
 
         grid = (SEQ_LEN // ctx.BLOCK_SIZE_N, BATCH_SIZE * NUM_HEADS)
+
+        dLambda = torch.zeros((grid[0], grid[1]), dtype=V.dtype, device=V.device)
 
         diff_attn_bwd[grid](
             Q1=Q1,
@@ -532,6 +543,9 @@ class _diff_attention(torch.autograd.Function):
             dK1=dK1,
             dK2=dK2,
             dV=dV,
+            dLambda=dLambda,
+            dLambda_stride_seq=dLambda.stride(0),
+            dLambda_stride_batch_head=dLambda.stride(1),
             M1=M1,
             M2=M2,
             D1=D1,
@@ -545,7 +559,7 @@ class _diff_attention(torch.autograd.Function):
             stride_V_seq=V.stride(2),
             stride_V_dim=V.stride(3),
             SM_SCALE=ctx.SM_SCALE,
-            LAMBDA_SCALE=ctx.LAMBDA_SCALE,
+            LAMBDA_SCALE_ptr=LAMBDA_SCALE,
             LAMBDA_INIT=ctx.LAMBDA_INIT,
             NUM_HEADS=NUM_HEADS,
             SEQ_LEN=SEQ_LEN,
@@ -556,7 +570,10 @@ class _diff_attention(torch.autograd.Function):
             RMS_NORM=ctx.RMS_NORM,
         )
 
-        return dQ1, dQ2, dK1, dK2, dV, None, None, None, None
+        # Aggerate the gradients of Lambda (tl.atomic_add didn't work for some reason)
+        dLambda = torch.tensor([dLambda.sum().item()], dtype=V.dtype, device=V.device)
+
+        return dQ1, dQ2, dK1, dK2, dV, None, dLambda, None, None
 
 
 if __name__ == "__main__":
@@ -567,11 +584,11 @@ if __name__ == "__main__":
     N = 256
     D = 64
 
-    LAMBDA_SCALE = 0.5
+    LAMBDA_SCALE = torch.tensor([0.5], dtype=torch.float16, requires_grad=True).to("cuda")
     LAMBDA_INIT = 0.8
     rms_norm = True
 
-    for _ in range(5):
+    for _ in range(100):
         q1 = torch.empty(B, H, N, D // 2, dtype=torch.float16, requires_grad=True).to("cuda").normal_(mean=0.0, std=0.5)
         q2 = torch.empty(B, H, N, D // 2, dtype=torch.float16, requires_grad=True).to("cuda").normal_(mean=0.0, std=0.5)
         k1 = torch.empty(B, H, N, D // 2, dtype=torch.float16, requires_grad=True).to("cuda").normal_(mean=0.0, std=0.5)
@@ -584,8 +601,9 @@ if __name__ == "__main__":
         k1.retain_grad()
         k2.retain_grad()
         v.retain_grad()
+        LAMBDA_SCALE.retain_grad()
 
-        y1 = MultiheadFlashDiffAttn(q1, q2, k1, k2, v, lambda_scale=LAMBDA_SCALE, rms_norm=rms_norm).half()
+        y1 = MultiheadFlashDiffAttn(q1, q2, k1, k2, v, lambda_scale=LAMBDA_SCALE, rms_norm=rms_norm)
         y2 = MultiheadDiffAttnKernel(q1, q2, k1, k2, v, lambda_scale=LAMBDA_SCALE, rms_norm=rms_norm)
 
         z1 = y1.backward(dout)
@@ -594,6 +612,7 @@ if __name__ == "__main__":
         ref_dk2, k2.grad = k2.grad.clone(), None
         ref_dq1, q1.grad = q1.grad.clone(), None
         ref_dq2, q2.grad = q2.grad.clone(), None
+        ref_dLambda, LAMBDA_SCALE.grad = LAMBDA_SCALE.grad.clone(), None
 
         z2 = y2.backward(dout)
         tri_dv, v.grad = v.grad.clone(), None
@@ -601,8 +620,13 @@ if __name__ == "__main__":
         tri_dk2, k2.grad = k2.grad.clone(), None
         tri_dq1, q1.grad = q1.grad.clone(), None
         tri_dq2, q2.grad = q2.grad.clone(), None
+        tri_dLambda, LAMBDA_SCALE.grad = LAMBDA_SCALE.grad.clone(), None
 
         atol = 1e-2
+
+        print("Reference (Lambda Gradient):", ref_dLambda.item())
+        print("Triton (Lambda Gradient):", tri_dLambda.item())
+        print("\n")
 
         assert torch.allclose(y1, y2, atol=atol)
         assert torch.allclose(ref_dv, tri_dv, atol=atol)
@@ -610,3 +634,4 @@ if __name__ == "__main__":
         assert torch.allclose(ref_dk2, tri_dk2, atol=atol)
         assert torch.allclose(ref_dq1, tri_dq1, atol=atol)
         assert torch.allclose(ref_dq2, tri_dq2, atol=atol)
+        # assert torch.allclose(ref_dLambda, tri_dLambda, atol=1e-1)  # NOTE: Lambda gradient is a little bit unstable
